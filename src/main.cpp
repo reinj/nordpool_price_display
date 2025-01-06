@@ -3,6 +3,7 @@
 #include <Fonts/FreeMonoBold12pt7b.h>
 #include <Fonts/FreeMono9pt7b.h>
 #include "GxEPD2_display_selection_new_style.h"
+#include <ESP8266WiFi.h>
 //#include "common.h"
 
 float* avgPriceToday;
@@ -10,6 +11,9 @@ float* avgPriceTomorrow;
 float* realPriceNow;
 
 const float redPrice = 12.00;
+
+const char* ssid = "yourNetworkName";
+const char* password = "yourNetworkPassword";
 
 const uint8_t letter_H[]      PROGMEM = {0x66, 0x66, 0x66, 0x7e, 0x7e, 0x66, 0x66, 0x66};
 const uint8_t letter_O[]      PROGMEM = {0x18, 0x3c, 0x66, 0x66, 0x66, 0x66, 0x3c, 0x18};
@@ -22,6 +26,8 @@ const uint8_t letter_I[]      PROGMEM = {0x7e, 0x7e, 0x18, 0x18, 0x18, 0x18, 0x7
 const uint8_t letter_T[]      PROGMEM = {0x7e, 0x7e, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18};
 const uint8_t letter_AE[]     PROGMEM = {0x42, 0x18, 0x3c, 0x66, 0x66, 0x7e, 0x7e, 0x66};
 const uint8_t letter_A[]      PROGMEM = {0x18, 0x3c, 0x66, 0x66, 0x7e, 0x7e, 0x66, 0x66};
+
+void getValuesFromServer();
 
 class prices {
   private:
@@ -134,39 +140,78 @@ class prices {
     }
 
 };
-  
-void displayUpdate()
-{
-  prices price;
-  
-  display.setFullWindow();
-  display.firstPage();
-  do
-  {
-    price.hourlyNow(*realPriceNow);
-    price.tomorrowAverage(*avgPriceTomorrow);
-    price.todayAverage(*avgPriceToday);
-    //void drawLine(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1, uint16_t color);
-    //void drawFastHLine(uint8_t x0, uint8_t y0, uint8_t length, uint16_t color);
-    //display.drawLine(0, (display.height() / 2), display.width(), (display.height() / 2), GxEPD_BLACK);
-    display.drawFastHLine(0, (display.height() / 2) - 1, display.width(), GxEPD_BLACK);
-    display.drawFastHLine(0, (display.height() / 2) + 0, display.width(), GxEPD_BLACK);
-    display.drawFastHLine(0, (display.height() / 2) + 1, display.width(), GxEPD_BLACK);
-    //void drawFastVLine(uint16_t x0, uint16_t y0, uint16_t length, uint16_t color);
-    display.drawLine((display.width() / 2), (display.height() / 2), (display.width() / 2), display.height(), GxEPD_BLACK);
-    display.drawLine((display.width() / 2) - 1, (display.height() / 2), (display.width() / 2) - 1, display.height(), GxEPD_BLACK);
-    display.drawLine((display.width() / 2) + 1, (display.height() / 2), (display.width() / 2) + 1, display.height(), GxEPD_BLACK);
-    
-  }
-  while (display.nextPage());
 
-  delete avgPriceToday; 
-  delete avgPriceTomorrow; 
-  delete realPriceNow; 
-  avgPriceToday = nullptr; 
-  avgPriceTomorrow = nullptr; 
-  realPriceNow = nullptr; 
-}
+class Screen{
+  public:
+
+  void wifiConnected()
+  {
+    const char* connectedTo = "Connected to SSID ";
+    char connectSentence[50];
+    strcpy(connectSentence, connectedTo);
+    strcat(connectSentence, ssid);
+
+    display.setFullWindow();
+    display.firstPage();
+    do
+    {
+      display.setRotation(1);
+      display.setFont(&FreeMonoBold12pt7b);
+      display.setTextColor(GxEPD_BLACK);
+      int16_t tbx, tby; uint16_t tbw, tbh;
+      display.getTextBounds(connectSentence, 0, 0, &tbx, &tby, &tbw, &tbh);
+      // center the bounding box by transposition of the origin:
+      uint16_t x = ((display.width() - tbw) / 2) - tbx;
+      uint16_t y = ((display.height() - tbh) / 2) - tby;
+      display.fillScreen(GxEPD_WHITE);
+      display.setCursor(x, y + 12);
+      display.print(connectedTo);
+      display.getTextBounds("000.000.000.000", 0, 0, &tbx, &tby, &tbw, &tbh);
+      x = ((display.width() - tbw) / 2) - tbx;
+      y = ((display.height() - tbh) / 2) - tby;
+      display.setCursor(x, y - 12);
+      display.print(WiFi.localIP());
+    }
+    while (display.nextPage());
+
+    delete connectedTo;
+    connectedTo = nullptr;
+  }
+
+
+  void displayUpdate()
+  {
+    prices price;
+    
+    display.setFullWindow();
+    display.firstPage();
+    do
+    {
+      getValuesFromServer();
+      price.hourlyNow(*realPriceNow);
+      price.tomorrowAverage(*avgPriceTomorrow);
+      price.todayAverage(*avgPriceToday);
+
+      display.drawFastHLine(0, (display.height() / 2) - 1, display.width(), GxEPD_BLACK);
+      display.drawFastHLine(0, (display.height() / 2) + 0, display.width(), GxEPD_BLACK);
+      display.drawFastHLine(0, (display.height() / 2) + 1, display.width(), GxEPD_BLACK);
+
+      display.drawLine((display.width() / 2), (display.height() / 2), (display.width() / 2), display.height(), GxEPD_BLACK);
+      display.drawLine((display.width() / 2) - 1, (display.height() / 2), (display.width() / 2) - 1, display.height(), GxEPD_BLACK);
+      display.drawLine((display.width() / 2) + 1, (display.height() / 2), (display.width() / 2) + 1, display.height(), GxEPD_BLACK);
+      
+    }
+    while (display.nextPage());
+
+    delete avgPriceToday; 
+    delete avgPriceTomorrow; 
+    delete realPriceNow;
+
+    avgPriceToday     = nullptr; 
+    avgPriceTomorrow  = nullptr; 
+    realPriceNow      = nullptr; 
+  }
+};
 
 void getValuesFromServer()
 {
@@ -184,9 +229,24 @@ void getValuesFromServer()
 
 void setup()
 {
-  getValuesFromServer();
+  Screen screen;
+  Serial.begin(115200);
+  Serial.println();
+
+  WiFi.begin(ssid,password);
+  Serial.print("Connecting");
+  while (WiFi.status() != WL_CONNECTED)
+  {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println();
+
+  Serial.print("Connected, IP address: ");
+  Serial.println(WiFi.localIP());
+
   display.init(115200);
-  displayUpdate();
+  screen.displayUpdate();
   display.hibernate();
 }
 
