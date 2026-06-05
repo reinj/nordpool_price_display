@@ -4,16 +4,69 @@
 #include <Fonts/FreeMono9pt7b.h>
 #include "GxEPD2_display_selection_new_style.h"
 #include <ESP8266WiFi.h>
+#include <ESP8266HTTPClient.h>
+#include <WiFiClientSecure.h>
+#include <lwip/dns.h>
+#include "credentials.h"
 //#include "common.h"
 
 float* avgPriceToday;
 float* avgPriceTomorrow;
 float* realPriceNow;
 
-const float redPrice = 12.00;
+// Zero-allocation stream helpers — read one char at a time, no heap involved.
+static bool streamSkipTo(WiFiClient& s, const char* pat, unsigned long timeoutMs) {
+  int pLen = strlen(pat), matched = 0;
+  unsigned long deadline = millis() + timeoutMs;
+  while (millis() < deadline) {
+    if (!s.available()) { yield(); continue; }
+    char c = s.read();
+    matched = (c == pat[matched]) ? matched + 1 : (c == pat[0] ? 1 : 0);
+    if (matched == pLen) return true;
+  }
+  return false;
+}
+static long streamReadLong(WiFiClient& s, unsigned long timeoutMs) {
+  long v = 0; bool any = false;
+  unsigned long deadline = millis() + timeoutMs;
+  while (millis() < deadline) {
+    if (!s.available()) { yield(); continue; }
+    char c = s.read();
+    if (c >= '0' && c <= '9') { v = v * 10 + (c - '0'); any = true; }
+    else if (any) break;
+  }
+  return any ? v : -1;
+}
+static float streamReadFloat(WiFiClient& s, unsigned long timeoutMs) {
+  long intPart = 0, fracPart = 0, fracDiv = 1;
+  bool hasDot = false, any = false;
+  unsigned long deadline = millis() + timeoutMs;
+  while (millis() < deadline) {
+    if (!s.available()) { yield(); continue; }
+    char c = s.read();
+    if (c >= '0' && c <= '9') {
+      if (!hasDot) { intPart = intPart * 10 + (c - '0'); }
+      else         { fracPart = fracPart * 10 + (c - '0'); fracDiv *= 10; }
+      any = true;
+    } else if (c == '.') { hasDot = true; }
+    else if (any) break;
+  }
+  return any ? (float)intPart + (float)fracPart / fracDiv : 0.0f;
+}
+// After streamReadFloat consumes the '}' that closes an entry object, check whether
+// the next significant character is ']' (end of array) or ',' (another entry).
+static bool streamAtArrayEnd(WiFiClient& s, unsigned long timeoutMs) {
+  unsigned long deadline = millis() + timeoutMs;
+  while (millis() < deadline) {
+    if (!s.available()) { yield(); continue; }
+    char c = s.read();
+    if (c == ']') return true;
+    if (c == ',') return false;
+  }
+  return true;
+}
 
-const char* ssid = "yourNetworkName";
-const char* password = "yourNetworkPassword";
+const float redPrice = 12.00;
 
 const uint8_t letter_H[]      PROGMEM = {0x66, 0x66, 0x66, 0x7e, 0x7e, 0x66, 0x66, 0x66};
 const uint8_t letter_O[]      PROGMEM = {0x18, 0x3c, 0x66, 0x66, 0x66, 0x66, 0x3c, 0x18};
@@ -28,6 +81,7 @@ const uint8_t letter_AE[]     PROGMEM = {0x42, 0x18, 0x3c, 0x66, 0x66, 0x7e, 0x7
 const uint8_t letter_A[]      PROGMEM = {0x18, 0x3c, 0x66, 0x66, 0x7e, 0x7e, 0x66, 0x66};
 
 void getValuesFromServer();
+void syncTime();
 
 class prices {
   private:
@@ -213,17 +267,118 @@ class Screen{
   }
 };
 
+void syncTime()
+{
+  IPAddress ntpIP;
+  if (WiFi.hostByName("pool.ntp.org", ntpIP))
+    Serial.printf("NTP DNS ok: %s\n", ntpIP.toString().c_str());
+  else
+    Serial.println("NTP DNS failed");
+
+  configTime(0, 0, "pool.ntp.org", "time.google.com", "time.cloudflare.com");
+  setenv("TZ", "EET-2EEST,M3.5.0/3,M10.5.0/4", 1);
+  tzset();
+
+  Serial.print("Syncing time");
+  unsigned long start = millis();
+  while (time(nullptr) < 1000000000ul) {
+    if (millis() - start > 30000) {
+      Serial.printf(" timed out (ts=%lu)\n", (unsigned long)time(nullptr));
+      return;
+    }
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.printf(" done (ts=%lu)\n", (unsigned long)time(nullptr));
+}
+
 void getValuesFromServer()
 {
-  //Demo code to get values from server
-  float a = 12.58;
-  float b = 11.52;
-  float c = 132.45;
+  float todayAvg = 0, tomorrowAvg = 0, currentPrice = 0;
 
-  avgPriceToday = new float(a);
-  avgPriceTomorrow = new float(b);
-  realPriceNow = new float(c);
+  time_t now = time(nullptr);
+  struct tm localNow;
+  localtime_r(&now, &localNow);
 
+  struct tm todayMidnight = localNow;
+  todayMidnight.tm_hour = 0; todayMidnight.tm_min = 0; todayMidnight.tm_sec = 0;
+  time_t todayStart = mktime(&todayMidnight);
+
+  struct tm tomorrowMidnight = localNow;
+  tomorrowMidnight.tm_mday += 1;
+  tomorrowMidnight.tm_hour = 0; tomorrowMidnight.tm_min = 0; tomorrowMidnight.tm_sec = 0;
+  time_t tomorrowStart = mktime(&tomorrowMidnight);
+
+  struct tm tomorrowEndTm = localNow;
+  tomorrowEndTm.tm_mday += 1;
+  tomorrowEndTm.tm_hour = 23; tomorrowEndTm.tm_min = 59; tomorrowEndTm.tm_sec = 59;
+  time_t tomorrowEnd = mktime(&tomorrowEndTm);
+
+  char startStr[30], endStr[30];
+  struct tm utcStart, utcEnd;
+  gmtime_r(&todayStart, &utcStart);
+  gmtime_r(&tomorrowEnd, &utcEnd);
+  strftime(startStr, sizeof(startStr), "%Y-%m-%dT%H:%M:%S.000Z", &utcStart);
+  strftime(endStr,   sizeof(endStr),   "%Y-%m-%dT%H:%M:%S.000Z", &utcEnd);
+
+  char url[200];
+  snprintf(url, sizeof(url),
+    "https://dashboard.elering.ee/api/nps/price?start=%s&end=%s",
+    startStr, endStr);
+
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient https;
+  https.setTimeout(10000);
+  https.useHTTP10(true);  // HTTP/1.0 prevents chunked Transfer-Encoding so getStream() is parseable
+
+  Serial.printf("Free heap before HTTPS: %u\n", ESP.getFreeHeap());
+
+  if (https.begin(client, url)) {
+    int code = https.GET();
+    Serial.printf("Elering HTTP %d (%s)\n", code, https.errorToString(code).c_str());
+
+    if (code == 200) {
+      WiFiClient* stream = https.getStreamPtr();
+      float todayTotal = 0, tomorrowTotal = 0;
+      int todayCount = 0, tomorrowCount = 0;
+      float foundPrice = -1;
+      time_t currentHourStart = now - (now % 3600);
+
+      if (streamSkipTo(*stream, "\"ee\":[", 8000)) {
+        while (streamSkipTo(*stream, "\"timestamp\":", 3000)) {
+          long ts = streamReadLong(*stream, 1000);
+          if (ts < 0) break;
+          if (!streamSkipTo(*stream, "\"price\":", 2000)) break;
+          float price = streamReadFloat(*stream, 1000);
+
+          if ((time_t)ts == currentHourStart) foundPrice = price;
+          if ((time_t)ts >= todayStart && (time_t)ts < tomorrowStart) {
+            todayTotal += price; todayCount++;
+          } else if ((time_t)ts >= tomorrowStart && (time_t)ts <= tomorrowEnd) {
+            tomorrowTotal += price; tomorrowCount++;
+          }
+
+          // streamReadFloat consumed the '}' closing this entry; stop if ']' follows
+          if (streamAtArrayEnd(*stream, 1000)) break;
+        }
+      }
+
+      Serial.printf("todayCount=%d tomorrowCount=%d foundPrice=%.2f\n",
+        todayCount, tomorrowCount, foundPrice);
+
+      if (todayCount > 0)    todayAvg     = todayTotal    / todayCount;
+      if (tomorrowCount > 0) tomorrowAvg  = tomorrowTotal / tomorrowCount;
+      currentPrice = (foundPrice >= 0) ? foundPrice : todayAvg;
+    }
+    https.end();
+  } else {
+    Serial.println("HTTPS begin failed");
+  }
+
+  avgPriceToday    = new float(todayAvg);
+  avgPriceTomorrow = new float(tomorrowAvg);
+  realPriceNow     = new float(currentPrice);
 }
 
 
@@ -242,9 +397,23 @@ void setup()
   }
   Serial.println();
 
-  Serial.print("Connected, IP address: ");
-  Serial.println(WiFi.localIP());
+  Serial.printf("Connected, IP: %s\n",
+    WiFi.localIP().toString().c_str());
 
+  // Force DNS via lwIP — ESP8266 sometimes doesn't pick it up from DHCP.
+  // This core maps ip_addr_t to ip4_addr_t (lwIP1 style: single .addr field).
+  ip_addr_t dns1, dns2;
+  IP4_ADDR(&dns1, 8, 8, 8, 8);
+  IP4_ADDR(&dns2, 8, 8, 4, 4);
+  dns_setserver(0, &dns1);
+  dns_setserver(1, &dns2);
+  delay(100);
+
+  IPAddress testIP;
+  Serial.printf("DNS google.com: %s\n",
+    WiFi.hostByName("google.com", testIP) ? testIP.toString().c_str() : "FAILED");
+
+  syncTime();
   display.init(115200);
   screen.displayUpdate();
   display.hibernate();
